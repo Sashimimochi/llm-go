@@ -7,14 +7,6 @@ services:
     working_dir: $GOPATH/src
     ports:
       - 11434:11434
-  webui:
-    image: ghcr.io/open-webui/open-webui:main
-    ports:
-      - 3000:8080
-    environment:
-      - WEBUI_AUTH=False
-    extra_hosts:
-      - host.docker.internal:host-gateway
   app:
     build: app
     tty: true
@@ -23,3 +15,6 @@ services:
     working_dir: /go/src/app
     extra_hosts:
       - host.docker.internal:host-gateway
+    ports:
+      - 8080:8080
+    command: ["go", "run", "main.go"]

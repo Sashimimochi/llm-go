@@ -1,207 +1,319 @@
 package main
 
 import (
-    "bytes"
-    "encoding/json"
-    "fmt"
-    "io/ioutil"
-    "log"
-    "net/http"
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"time"
 
-    usearch "github.com/unum-cloud/usearch/golang"
+	"github.com/labstack/echo/v4"
+	usearch "github.com/unum-cloud/usearch/golang"
 )
 
+type EmbeddingVector [][]float32
+
 type EmbeddingResponse struct {
-    Embedding []float32 `json:"embedding"`
+	Embedding []float32 `json:"embedding"`
+}
+
+type EmbeddingRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+}
+
+type ChatRequest struct {
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
+}
+
+type Message struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
 }
 
 type ChatResponse struct {
-    Model string `json:"model"`
-    CreatedAt string `json:"created_at"`
-    Message struct {
-        Role string `json:"role"`
-        Content string `json:"content"`
-    }
-    DoneReason string `json:"done_reason"`
-    Done bool `json:"done"`
-    TotalDuration int `json:"total_duration"`
-    LoadDuration int `json:"load_duration"`
-    PromptEvalCount int `json:"prompt_eval_count"`
-    PromptEvalDuration int `json:"prompt_eval_duration"`
-    EvalCount int `json:"eval_count"`
-    EvalDuration int `json:"eval_duration"`
+	Model              string    `json:"model"`
+	CreatedAt          time.Time `json:"created_at"`
+	Message            Message   `json:"message"`
+	DoneReason         string    `json:"done_reason"`
+	Done               bool      `json:"done"`
+	TotalDuration      int64     `json:"total_duration"`
+	LoadDuration       int       `json:"load_duration"`
+	PromptEvalCount    int       `json:"prompt_eval_count"`
+	PromptEvalDuration int       `json:"prompt_eval_duration"`
+	EvalCount          int       `json:"eval_count"`
+	EvalDuration       int64     `json:"eval_duration"`
 }
 
+const (
+	defaultOllamaURL = "http://host.docker.internal:11434/api"
+	modelName        = "llm"
+)
+
 func main() {
-    var texts[3] string = [3]string {"RAGは、プロンプトと呼ばれるLLMへの入力情報にモデル外部の情報源からの検索結果を付加して、検索結果に基づいた回答をさせています。モデルはプロンプトに含まれているリファレンス情報をもとにユーザからの要望に回答すればいいので、知識にないことであっても正確に答えられるようになるのではないかという発想です。", "HNSWはグラフ探索型のアルゴリズムでベクトル距離に応じて事前にグラフを構築しておきます。探索は高速だが、事前に構築したグラフの読み込みに時間がかかるという特性があります。また、圧縮せずに生データをそのままメモリ上に展開して処理をするので、メモリの消費量が大きくなります。2020年にGoogleがScaNNというより高速で高精度・高効率なアルゴリズムを提唱しましたが、2018年時点ではmillion-scaleのドキュメントの近似近傍探索では決定版と言われていたアルゴリズムです。", "根幹となる文のポジティブ/ネガティブ判定を実装していきます。文のポジネガ判定の方法もいろいろあると思いますが、今回は単語ごとの印象(極性)を分析していく極性分析を行うことにします。単語ごとの極性をまとめた極性辞書は、東京工業大学精密工学研究所高村研究室が公開している単語感情極性対応表を使いました。表の中身は単語ごとに-1~1までの極性値が載っています。これに文を単語分割したものを渡してポジネガ値を計算することにします。"}
-    embeddings := make([][]float32, 0)
+	e := echo.New()
+	e.GET("/chat", func(c echo.Context) error {
+		indexPath, err := createIndex()
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": fmt.Sprintf("%v", err),
+			})
+		}
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": fmt.Sprintf("%v", err),
+			})
+		}
+		// RAGを実行
+		prompt := c.QueryParam("prompt")
+		if prompt == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{
+				"error": "promptを指定してください",
+			})
+		}
+		log.Printf("user prompt: %v", prompt)
+		ref, err := Search(indexPath, prompt)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": fmt.Sprintf("%v", err),
+			})
+		}
+		chatResp, err := chat(prompt + "\n===\n以下の情報を下に回答してください。\n===\n" + ref)
+		if err != nil {
+			err_msg := fmt.Sprintf("Failed to chat: %v", err)
+			log.Fatalf(err_msg)
+			return c.JSON(http.StatusInternalServerError, map[string]string{
+				"error": err_msg,
+			})
+		}
 
-    for _, text := range texts {
-        embedding, err := embeddingText(text)
-        if err != nil {
-            log.Fatalf("%v", err)
-        }
-        embeddings = append(embeddings, embedding)
-    }
-    // usearchでインデックスを作成
-    vectorSize := len(embeddings[0])
-    vectorsCount := len(embeddings)
-    log.Printf("Embedding Dimension: %d, Document size: %d", vectorSize, vectorsCount)
-    conf := usearch.DefaultConfig(uint(vectorSize))
-    index, err := usearch.NewIndex(conf)
-    if err != nil {
-        log.Fatalf("Failed to create Index: %v", err)
-    }
-    defer index.Destroy()
+		return c.JSON(http.StatusOK, map[string]string{
+			"message": chatResp,
+		})
+	})
 
-    // インデックスに追加
-    err = index.Reserve(uint(vectorsCount))
-    if err != nil {
-        log.Fatalf("Failed to reserve space for Index: %v", err)
-    }
-    for i := 0; i < vectorsCount; i++ {
-        err = index.Add(usearch.Key(i), embeddings[i])
-        if err != nil {
-            log.Fatalf("Failed to add vector to Index: %v", err)
-        }    
-    }
+	// Start Server
+	e.Logger.Fatal(e.Start(":8080"))
+}
 
-    // インデックスを保存
-    indexPath := "vector.index"
-    err = index.Save(indexPath)
-    if err != nil {
-        log.Fatalf("Failed to save Index: %v", err)
-    }
-    log.Printf("Index successfully created and saved to %v", indexPath)
+func readDocs() ([]string, error) {
+	docFilename := "docs.txt"
+	file, err := os.Open(docFilename)
+	if err != nil {
+		log.Fatalf("%v", err)
+		return nil, err
+	}
+	defer file.Close()
+	var texts []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		texts = append(texts, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		log.Fatalf("%v", err)
+		return nil, err
+	}
+	return texts, nil
+}
 
-    Search(indexPath)
+func createIndex() (string, error) {
+	indexPath := "vector.index"
+	if _, err := os.Stat(indexPath); err == nil {
+		return indexPath, nil
+	}
 
-    chatResp, err := chat("RAGという検索手法について完結に教えてください。")
-    if err != nil {
-        log.Fatalf("Failed to chat: %v", err)
-    }
-    log.Printf("chat: %v", chatResp)
+	texts, err := readDocs()
+	if err != nil {
+		return "", err
+	}
+	embeddings, err := createVectors(texts)
+	if err != nil {
+		return "", err
+	}
+
+	log.Printf("Creating Vector Index")
+	// usearchでインデックスを作成
+	vectorSize := len(embeddings[0])
+	vectorsCount := len(embeddings)
+	log.Printf("Embedding Dimension: %d, Document size: %d", vectorSize, vectorsCount)
+	conf := usearch.DefaultConfig(uint(vectorSize))
+	index, err := usearch.NewIndex(conf)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to create Index: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+	defer index.Destroy()
+
+	// インデックスに追加
+	err = index.Reserve(uint(vectorsCount))
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to reserve space for Index: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+	for i := 0; i < vectorsCount; i++ {
+		err = index.Add(usearch.Key(i), embeddings[i])
+		if err != nil {
+			err_msg := fmt.Sprintf("Failed to add vector to Index: %v", err)
+			log.Fatalf(err_msg)
+			return "", fmt.Errorf(err_msg)
+		}
+	}
+
+	// インデックスを保存
+	err = index.Save(indexPath)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to save Index: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+	log.Printf("Index successfully created and saved to %v", indexPath)
+	return indexPath, nil
+}
+
+func createVectors(texts []string) (EmbeddingVector, error) {
+	// ベクトルデータを作成
+	log.Printf("Creating Embedding Vectors")
+	embeddings := make(EmbeddingVector, 0)
+	for _, text := range texts {
+		embedding, err := embeddingText(text)
+		if err != nil {
+			log.Fatalf("%v", err)
+			return nil, err
+		}
+		embeddings = append(embeddings, embedding)
+	}
+	return embeddings, nil
 }
 
 func chat(prompt string) (string, error) {
-    // URL
-    url := "http://host.docker.internal:11434/api/chat"
+	log.Printf("Chating to LLM")
+	const url = defaultOllamaURL + "/chat"
 
-    // リクエストボディを作成
-    jsonData := []byte(fmt.Sprintf(`{
-        "model": "llm",
-        "stream": false,
-        "messages": [
-            { "role": "user", "content": "%v" }
-        ]
-    }`, prompt))
+	msg := Message{
+		Role:    "user",
+		Content: prompt,
+	}
+	req := ChatRequest{
+		Model:    modelName,
+		Stream:   false,
+		Messages: []Message{msg},
+	}
 
-    // POSTリクエストを作成
-    req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-    if err != nil {
-        return "", fmt.Errorf("Failed to create request: %v", err)
-    }
-    req.Header.Set("Content-Type", "application/json")
+	resp, err := talkOllama(url, req)
+	if err != nil {
+		return "", err
+	}
 
-    // クライアントを作成
-    client := &http.Client{}
-    resp, err := client.Do(req)
-    if err != nil {
-        return "", fmt.Errorf("Failed to make POST request: %v", err)
-    }
-    defer resp.Body.Close()
-
-    // レスポンスボディを読み取る
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        return "", fmt.Errorf("Failed to read response body: %v", err)
-    }
-
-    // レスポンスボディをパース
-    var chatResp ChatResponse
-    err = json.Unmarshal(body, &chatResp)
-    if err != nil {
-        log.Printf("Body: %v", string(body))
-        return "", fmt.Errorf("Failed to parse response body: %v", err)
-    }
-
-    // レスポンス
-    log.Printf("resp: %v", string(body))
-    chat := chatResp.Message.Content
-    return chat, nil
+	// レスポンス
+	chat := resp.Message.Content
+	return chat, nil
 }
 
-func embeddingText(prompt string) ([]float32, error){
-    // URL
-    url := "http://host.docker.internal:11434/api/embeddings"
-
-    // リクエストボディを作成
-    jsonData := []byte(fmt.Sprintf(`{
-        "model": "llm",
-        "prompt": "%v"
-    }`, prompt))
-
-    // POSTリクエストを作成
-    req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-    if err != nil {
-        return nil, fmt.Errorf("Failed to create request: %v", err)
-    }
-    req.Header.Set("Content-Type", "application/json")
-
-    // クライアントを作成
-    client := &http.Client{}
-    resp, err := client.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("Failed to make POST request: %v", err)
-    }
-    defer resp.Body.Close()
-
-    // レスポンスボディを読み取る
-    body, err := ioutil.ReadAll(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("Failed to read response body: %v", err)
-    }
-
-    // レスポンスボディをパース
-    var embeddingResp EmbeddingResponse
-    err = json.Unmarshal(body, &embeddingResp)
-    if err != nil {
-        log.Printf("Body: %v", string(body))
-        return nil, fmt.Errorf("Failed to parse response body: %v", err)
-    }
-
-    // 埋め込みベクトルを取得
-    embedding := embeddingResp.Embedding
-    return embedding, nil
+func talkOllama(url string, ollamaReq ChatRequest) (*ChatResponse, error) {
+	js, err := json.Marshal(&ollamaReq)
+	if err != nil {
+		return nil, err
+	}
+	client := http.Client{}
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(js))
+	if err != nil {
+		return nil, err
+	}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+	ollamaResp := ChatResponse{}
+	err = json.NewDecoder(httpResp.Body).Decode(&ollamaResp)
+	return &ollamaResp, err
 }
 
-func Search(indexPath string) {
-    text := "RAGという検索手法について教えてください。"
-    embedding, err := embeddingText(text)
-    if err != nil {
-        log.Fatalf("%v", err)
-    }
+func embeddingText(prompt string) ([]float32, error) {
+	url := defaultOllamaURL + "/embeddings"
 
-    // usearchでインデックスを作成
-    vectorSize := len(embedding)
-    conf := usearch.DefaultConfig(uint(vectorSize))
-    index, err := usearch.NewIndex(conf)
-    if err != nil {
-        log.Fatalf("Failed to create Index: %v", err)
-    }
-    defer index.Destroy()
+	// リクエストボディを作成
+	req := EmbeddingRequest{
+		Model:  modelName,
+		Prompt: prompt,
+	}
+	js, err := json.Marshal(&req)
 
-    // Search
-    err = index.Load(indexPath)
-    if err != nil {
-        log.Fatalf("Failed to load Index: %v", err)
-    }
+	// POSTリクエストを作成
+	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(js))
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to create request: %v", err)
+		log.Fatalf(err_msg)
+		return nil, fmt.Errorf(err_msg)
+	}
 
-    keys, distances, err := index.Search(embedding, 3)
-    if err != nil {
-        log.Fatalf("Failed to search")
-    }
-    for i:=0; i < len(keys); i++ {
-        log.Printf("key: %v, distance: %v", keys[i], distances[i])
-    }
+	// クライアントを作成
+	client := &http.Client{}
+	httpResp, err := client.Do(httpReq)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to make POST request: %v", err)
+		log.Fatalf(err_msg)
+		return nil, fmt.Errorf(err_msg)
+	}
+	defer httpResp.Body.Close()
+
+	// レスポンスボディをパース
+	embeddingResp := EmbeddingResponse{}
+	err = json.NewDecoder(httpResp.Body).Decode(&embeddingResp)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to parse response body: %v", err)
+		log.Fatalf(err_msg)
+		return nil, fmt.Errorf(err_msg)
+	}
+
+	// 埋め込みベクトルを取得
+	embedding := embeddingResp.Embedding
+	return embedding, nil
+}
+
+func Search(indexPath string, prompt string) (string, error) {
+	log.Printf("Searching Nearest Neighbor Index")
+	embedding, err := embeddingText(prompt)
+	if err != nil {
+		log.Fatalf("%v", err)
+		return "", err
+	}
+
+	// usearchでインデックスを作成
+	vectorSize := len(embedding)
+	conf := usearch.DefaultConfig(uint(vectorSize))
+	index, err := usearch.NewIndex(conf)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to create Index: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+	defer index.Destroy()
+
+	// Search
+	err = index.Load(indexPath)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to load Index: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+
+	keys, distances, err := index.Search(embedding, 3)
+	if err != nil {
+		err_msg := fmt.Sprintf("Failed to search: %v", err)
+		log.Fatalf(err_msg)
+		return "", fmt.Errorf(err_msg)
+	}
+	for i := 0; i < len(keys); i++ {
+		log.Printf("key: %v, distance: %v", keys[i], distances[i])
+	}
+	texts, err := readDocs()
+	return texts[keys[0]], nil
 }
